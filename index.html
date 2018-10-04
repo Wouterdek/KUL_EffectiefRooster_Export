@@ -1,0 +1,332 @@
+<html>
+<head>
+	<script src="https://moment.github.io/luxon/global/luxon.min.js"></script>
+	<script type="text/javascript">
+		/**************************/
+		/*** SCRAPING & PARSING ***/
+		/**************************/
+
+		function retrieveSourceDocument(){
+			var source = document.getElementById("sourcecode").value;
+			var parser = new DOMParser();
+			var doc = parser.parseFromString(source, "text/html");
+			return doc;
+		}
+
+		function scrapeCalendarInfo(doc){
+			var calendarEntries = [];
+
+			// Find the next <i> element with a valid datetime format
+			for(var i = 0; i < doc.body.children.length; i++) {
+				var curElem = doc.body.children[i];
+				if(curElem.tagName == "I"){
+					var curDate = parseDate(curElem.innerText);
+					if(curDate == null){
+						continue;
+					}
+
+					// Find the next table
+					for(; i < doc.body.children.length; i++) {
+						var curElem = doc.body.children[i];
+						if(curElem.tagName == "TABLE"){
+							calendarEntries = calendarEntries.concat(parseCalendarTable(curDate, curElem));
+							break;
+						}
+					}
+				}
+			}
+
+			return calendarEntries;
+		}
+
+		function parseDate(text){
+			if(text == null){
+				return null;
+			}
+
+			var dateParts = text.split(" ");
+			if(dateParts.length == 0){
+				return null;
+			}
+
+			var numericDateWithColon = dateParts[dateParts.length-1];
+			if(numericDateWithColon.length != 11){
+				return null;
+			}
+
+			var numericDate = numericDateWithColon.substring(0, 10);
+			var dateParts = numericDate.split(".");
+			if(dateParts.length != 3){
+				return null;
+			}
+
+			return luxon.DateTime.fromObject({year: dateParts[2]/1, month: dateParts[1]/1, day: dateParts[0]/1, zone: 'Europe/Brussels'});
+		}
+
+		function parseCalendarTable(date, table){
+			var results = [];
+			var entries = table.children[0].children; //table.tbody.*
+			for (var i = 0; i < entries.length; i++) {
+				results.push(parseCalendarTableEntry(date, entries[i]));
+			}
+			return results;
+		}
+
+		function parseCalendarTableEntry(date, entry){
+			return {
+				timespan: parseEntryTimespan(date, entry.children[0]),
+				location: parseEntryLocation(entry.children[2]),
+				course: parseEntryCourse(entry.children[4])
+			};
+		}
+
+		function parseEntryTimespan(date, elem){
+			var spanParts = elem.innerText.split('\u2014');
+			return {
+				start: parseTimespan(date, spanParts[0]),
+				end: parseTimespan(date, spanParts[1])
+			};
+		}
+
+		function parseTimespan(date, time){
+			var parts = time.split(":");
+			return date.plus({hours: parts[0]/1, minutes: parts[1]/1});
+		}
+
+		function parseEntryLocation(elem){
+			return elem.innerText;
+		}
+
+		function parseEntryCourse(elem){
+			return {
+				name: elem.children[0].innerText,
+				link: elem.children[0].href
+			};
+		}
+
+		/*****************/
+		/*** FILTERING ***/
+		/*****************/
+
+		function generateFilterTable(){
+			var filterTable = document.getElementById("filterTable");
+
+			// Clear table
+			for (var i = filterTable.children.length - 1; i >= 0; i--) {
+				filterTable.removeChild(filterTable.children[i]);
+			}
+
+			// Add filter rows
+			var courseNames = new Set();
+			for (var i = 0; i < curCalendarInfo.length; i++) {
+				courseNames.add(curCalendarInfo[i].course.name);
+			}
+
+			var courseNamesSorted = []
+			for (var it = courseNames.values(), val= null; val=it.next().value; ) {
+				courseNamesSorted.push(val);	 
+			}
+			courseNamesSorted.sort();
+
+			for (var i = 0; i < courseNamesSorted.length; i++) {
+				var val = courseNamesSorted[i];
+				var row = document.createElement("tr");
+				row.innerHTML = `<input type="checkbox" name="`+val+`" onclick="updateFilter()">`+val;
+				filterTable.appendChild(row);
+			}
+		}
+
+		function updateFilterTableState(filter){
+			var filterTable = document.getElementById("filterTable");
+			for (var i = 0; i < filterTable.children.length; i++) {
+				var checkbox = filterTable.children[i].children[0];
+				var courseName = checkbox.name;
+				checkbox.checked = filter[courseName];
+			}
+		}
+
+		function generateFilter(){
+			var courseNames = {};
+			var filterTable = document.getElementById("filterTable");
+			for (var i = 0; i < filterTable.children.length; i++) {
+				var checkbox = filterTable.children[i].children[0];
+				var courseName = checkbox.name;
+				var isEnabled = checkbox.checked;
+				courseNames[courseName] = isEnabled;
+			}
+			return courseNames;
+		}
+
+		var curFilter = {};
+		function updateFilter(){
+			curFilter = generateFilter();
+		}
+
+		function loadFilter(){
+			openFile().then(json => {
+				var newFilter = JSON.parse(json);
+				curFilter = newFilter;
+				updateFilterTableState(curFilter);
+			});
+		}
+
+		function saveFilter(){
+			var json = JSON.stringify(curFilter);
+			downloadString(json, "text/json", "kul_schedule_filter.json");
+		}
+
+		function applyFilter(calendarInfo, filter){
+			var result = [];
+			for (var i = 0; i < calendarInfo.length; i++) {
+				if(filter[calendarInfo[i].course.name]){
+					result.push(calendarInfo[i]);
+				}
+			}
+			return result;
+		}
+
+		/***********************/
+		/*** ICAL GENERATION ***/
+		/***********************/
+
+		function generateICal(calendarInfo){
+			var data = "";
+			data += "BEGIN:VCALENDAR\n"; 
+			data += "VERSION:2.0\n";
+			data += "PRODID:-//calendargenerator/KUL CS Calendar generator//EN\n";
+			for(var i = 0; i < calendarInfo.length; i++){
+				data += generateICalEvent(calendarInfo[i]);
+			}
+			data += "END:VCALENDAR\n";
+			return data;
+		}
+
+		function padInt(val, minLength){
+			var str = ""+val;
+			while(str.length < minLength){
+				str = "0" + str;
+			}
+			return str;
+		}
+
+		function generateICalDateTimeString(datetime){
+			var v = datetime.setZone("utc"); //.toFormat("yyyyMMdd'T'HHmmss'Z'");
+			return `${v.year}${padInt(v.month, 2)}${padInt(v.day, 2)}T${padInt(v.hour, 2)}${padInt(v.minute, 2)}${padInt(v.second, 2)}Z`;
+		}
+
+		function generateICalEvent(event){
+			var e = "";
+			e += "BEGIN:VEVENT\n";
+			e += "SUMMARY:"+ event.course.name +"\n";
+			e += "DTSTART:"+ generateICalDateTimeString(event.timespan.start) +"\n";
+			e += "DTEND:"+ generateICalDateTimeString(event.timespan.end) +"\n";
+			e += "URL:"+event.course.link+"\n";
+			e += "LOCATION:"+event.location+"\n";
+			e += "END:VEVENT\n";
+			return e;
+		}
+
+		/*** MISC ***/
+
+		// Source: https://gist.github.com/danallison/3ec9d5314788b337b682
+		function downloadString(text, fileType, fileName) {
+			var blob = new Blob([text], { type: fileType });
+
+			var a = document.createElement('a');
+			a.download = fileName;
+			a.href = URL.createObjectURL(blob);
+			a.dataset.downloadurl = [fileType, a.download, a.href].join(':');
+			a.style.display = "none";
+			document.body.appendChild(a);
+			a.click();
+			document.body.removeChild(a);
+			setTimeout(function() { URL.revokeObjectURL(a.href); }, 1500);
+		}
+
+		function openFile() {
+			var input = document.createElement('input');
+			input.type = "file";
+			var prom = new Promise(function(resolve, reject){
+				input.onchange = () => {
+					var reader = new FileReader();
+					reader.onload = function(e) {
+						resolve(e.target.result);
+					};
+					reader.readAsText(input.files[0]);
+				}
+			});
+			//in.style.left = "";
+			document.body.appendChild(input);
+			input.click();
+			document.body.removeChild(input);
+			return prom;
+		}
+
+		var curCalendarInfo = null;
+		function loadCalendarInfo(){
+			var doc = retrieveSourceDocument();
+			curCalendarInfo = scrapeCalendarInfo(doc);
+
+			document.getElementById("exportSection").style.display = "block";
+			document.getElementById("statusLabel").innerText = "" + curCalendarInfo.length + " events ingeladen.";
+			generateFilterTable();
+		}
+
+		function downloadICal(){
+			var cal = applyFilter(curCalendarInfo, curFilter);
+			var icalData = generateICal(cal);
+			downloadString(icalData, "text/calendar", "calendar_export.ics");
+		}
+	</script>
+	<style>
+	body{
+		font-family: sans-serif;
+	}
+
+	#sourcecode{
+		width: 50%;
+		height: 200px;
+	}
+
+	#exportSection {
+		display: none;
+	}
+
+	#editor {
+		margin-left: 20px;
+		margin-bottom: 60px;
+	}
+	</style>
+</head>
+<body>
+	<h1>Effectief uurrooster -> ICal</h1>
+	<ol>
+		<li>
+		Ga naar het effectieve uurrooster (overzicht <a href="https://wms.cs.kuleuven.be/cs/studeren/master-computerwetenschappen/effectief-uurrooster">hier</a>, eerste semester <a href="https://people.cs.kuleuven.be/~btw/roosters1819/cws_semester_1.html">hier</a>)</li>
+		<li>
+			Kopier de broncode van de pagina. (rechtsklikken, paginabron bekijken, alles kopieren)
+		</li>
+		<li>
+			Plak de broncode in onderstaand veld en duw op "Inladen".
+		</li>
+	</ol>
+
+	<div id="editor">
+		<textarea id="sourcecode" placeholder="Broncode pagina"></textarea></br>
+		<button onclick="loadCalendarInfo()">Inladen</button>
+
+		<div id="exportSection">
+			<p id="statusLabel"></p>
+			<b>Selecteer alle vakken die je in je kalender wilt:</b></br>
+			<button onclick="loadFilter()">Filter laden</button>
+			<button onclick="saveFilter()">Filter opslaan</button>	
+			<table>
+				<tbody id="filterTable">
+				</tbody>
+			</table>
+			<b>Genereer een kalender bestand:</b></br>
+			<button onclick="downloadICal()" id="generateIcalButton">ICal genereren</button>	
+		</div>
+	</div>
+</body>
+</html>
